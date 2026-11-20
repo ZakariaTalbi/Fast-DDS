@@ -399,14 +399,23 @@ std::pair<bool, bool> PDPServerListener::check_server_discovery_conditions(
 
         if (ds_version != properties.end())
         {
-            if (std::stof(ds_version->second()) < 1.0)
+            try
             {
-                EPROSIMA_LOG_ERROR(RTPS_PDP_LISTENER, "Minimum " << dds::parameter_property_ds_version
-                                                                 << " is 1.0, found: " << ds_version->second());
+                if (std::stof(ds_version->second()) < 1.0)
+                {
+                    EPROSIMA_LOG_ERROR(RTPS_PDP_LISTENER, "Minimum " << dds::parameter_property_ds_version
+                                                                     << " is 1.0, found: " << ds_version->second());
+                    ret.first = false;
+                }
+                EPROSIMA_LOG_INFO(RTPS_PDP_LISTENER, "Participant " << dds::parameter_property_ds_version << ": "
+                                                                    << ds_version->second());
+            }
+            catch (const std::exception&)
+            {
+                EPROSIMA_LOG_ERROR(RTPS_PDP_LISTENER, "Malformed " << dds::parameter_property_ds_version << ": "
+                                                                   << ds_version->second());
                 ret.first = false;
             }
-            EPROSIMA_LOG_INFO(RTPS_PDP_LISTENER, "Participant " << dds::parameter_property_ds_version << ": "
-                                                                << ds_version->second());
         }
         else
         {
