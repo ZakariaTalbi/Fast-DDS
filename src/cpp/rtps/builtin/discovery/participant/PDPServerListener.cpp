@@ -162,14 +162,23 @@ void PDPServerListener::onNewCacheChangeAdded(
 
             if (ds_version != properties.end())
             {
-                if (std::stof(ds_version->second()) < 1.0)
+                try
                 {
-                    logError(RTPS_PDP_LISTENER, "Minimum " << dds::parameter_property_ds_version
-                                                           << " is 1.0, found: " << ds_version->second());
+                    if (std::stof(ds_version->second()) < 1.0)
+                    {
+                        logError(RTPS_PDP_LISTENER, "Minimum " << dds::parameter_property_ds_version
+                                                               << " is 1.0, found: " << ds_version->second());
+                        return;
+                    }
+                    logInfo(RTPS_PDP_LISTENER, "Participant " << dds::parameter_property_ds_version << ": "
+                                                              << ds_version->second());
+                }
+                catch (const std::exception&)
+                {
+                    logError(RTPS_PDP_LISTENER, "Malformed " << dds::parameter_property_ds_version << ": "
+                                                             << ds_version->second());
                     return;
                 }
-                logInfo(RTPS_PDP_LISTENER, "Participant " << dds::parameter_property_ds_version << ": "
-                                                          << ds_version->second());
             }
             else
             {

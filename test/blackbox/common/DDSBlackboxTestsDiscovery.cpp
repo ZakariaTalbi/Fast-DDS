@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 
 #include <atomic>
@@ -21,12 +22,14 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
 
 #include "BlackboxTests.hpp"
+#include "DatagramInjectionTransport.hpp"
 #include "PubSubParticipant.hpp"
 #include "PubSubReader.hpp"
 #include "PubSubWriter.hpp"
@@ -43,6 +46,7 @@
 #include <fastdds/rtps/common/Property.h>
 #include <fastdds/rtps/participant/ParticipantDiscoveryInfo.h>
 #include <fastdds/rtps/transport/test_UDPv4TransportDescriptor.h>
+#include <fastdds/rtps/transport/UDPv4TransportDescriptor.h>
 #include <fastrtps/xmlparser/XMLProfileManager.h>
 #include <rtps/transport/test_UDPv4Transport.h>
 #include <utils/SystemInfo.hpp>
@@ -1057,4 +1061,193 @@ TEST(DDSDiscovery, static_edp_malformed_entity_id_property)
     /* Clean up */
     factory->delete_participant(attacker);
     factory->delete_participant(victim);
+}
+
+//! Replaces the DS_VERSION value in any little endian DATA(p) sent by @p sender with @p value.
+static void tamper_ds_version(
+        std::vector<uint8_t>& datagram,
+        const eprosima::fastrtps::rtps::GuidPrefix_t& sender,
+        const std::string& value)
+{
+    constexpr size_t rtps_header_size = 20;
+    constexpr uint8_t data_id = 0x15;
+    constexpr uint16_t pid_sentinel = 0x0001;
+    constexpr uint16_t pid_property_list = 0x0059;
+    const uint8_t spdp_writer_id[] = {0x00, 0x01, 0x00, 0xc2};
+
+    auto get16 = [&datagram](size_t pos)
+            {
+                return static_cast<uint16_t>(datagram[pos] | (datagram[pos + 1] << 8));
+            };
+    auto get32 = [&get16](size_t pos)
+            {
+                return static_cast<uint32_t>(get16(pos) | (get16(pos + 2) << 16));
+            };
+    auto put16 = [&datagram](size_t pos, uint16_t v)
+            {
+                datagram[pos] = static_cast<uint8_t>(v & 0xff);
+                datagram[pos + 1] = static_cast<uint8_t>(v >> 8);
+            };
+    auto align4 = [](size_t v)
+            {
+                return (v + 3) & ~static_cast<size_t>(3);
+            };
+
+    if (datagram.size() < rtps_header_size ||
+            0 != memcmp(&datagram[8], sender.value, sender.size))
+    {
+        return;
+    }
+
+    size_t sub = rtps_header_size;
+    while (sub + 4 <= datagram.size())
+    {
+        uint8_t flags = datagram[sub + 1];
+        uint16_t sub_len = get16(sub + 2);
+        size_t body = sub + 4;
+
+        if (data_id == datagram[sub] && (flags & 0x01) && body + 20 <= datagram.size() &&
+                0 == memcmp(&datagram[body + 8], spdp_writer_id, sizeof(spdp_writer_id)))
+        {
+            size_t pos = body + 4 + get16(body + 2);
+            if (flags & 0x02)
+            {
+                while (pos + 4 <= datagram.size() && pid_sentinel != get16(pos))
+                {
+                    pos += 4 + get16(pos + 2);
+                }
+                pos += 4;
+            }
+            // Skip the encapsulation header
+            pos += 4;
+
+            while (pos + 4 <= datagram.size() && pid_sentinel != get16(pos))
+            {
+                if (pid_property_list == get16(pos))
+                {
+                    uint32_t count = get32(pos + 4);
+                    size_t prop = pos + 8;
+                    for (uint32_t i = 0; i < count; ++i)
+                    {
+                        uint32_t name_len = get32(prop);
+                        std::string name(reinterpret_cast<const char*>(&datagram[prop + 4]), name_len - 1);
+                        size_t value_pos = prop + 4 + align4(name_len);
+                        size_t next = value_pos + 4 + align4(get32(value_pos));
+
+                        if (eprosima::fastdds::dds::parameter_property_ds_version == name)
+                        {
+                            uint32_t new_len = static_cast<uint32_t>(value.size() + 1);
+                            std::vector<uint8_t> new_value(4 + align4(new_len), 0);
+                            for (size_t b = 0; b < 4; ++b)
+                            {
+                                new_value[b] = static_cast<uint8_t>(new_len >> (8 * b));
+                            }
+                            memcpy(&new_value[4], value.data(), value.size());
+
+                            uint16_t delta = static_cast<uint16_t>(new_value.size() - (next - value_pos));
+                            datagram.erase(datagram.begin() + value_pos, datagram.begin() + next);
+                            datagram.insert(datagram.begin() + value_pos, new_value.begin(), new_value.end());
+                            put16(pos + 2, static_cast<uint16_t>(get16(pos + 2) + delta));
+                            if (0 != sub_len)
+                            {
+                                put16(sub + 2, static_cast<uint16_t>(sub_len + delta));
+                            }
+                            return;
+                        }
+                        prop = next;
+                    }
+                }
+                pos += 4 + get16(pos + 2);
+            }
+        }
+
+        if (0 == sub_len)
+        {
+            break;
+        }
+        sub = body + sub_len;
+    }
+}
+
+//! Start a server, a client announcing @p bad_value as its DS_VERSION, and a well-formed client.
+//! The server must reject the first one and still discover the second one.
+static void check_server_rejects_ds_version(
+        const std::string& bad_value)
+{
+    using namespace eprosima;
+    using namespace eprosima::fastdds::dds;
+    using namespace eprosima::fastrtps::rtps;
+
+    GuidPrefix_t bad_client_prefix;
+    std::istringstream("44.53.0f.5f.45.50.52.4f.53.49.4d.41") >> bad_client_prefix;
+
+    // Clients cannot announce a custom DS_VERSION on this branch, so the server rewrites the one it
+    // receives from the bad client
+    auto server_transport = std::make_shared<eprosima::fastdds::rtps::DatagramInjectionTransportDescriptor>(
+        std::make_shared<eprosima::fastdds::rtps::UDPv4TransportDescriptor>());
+    server_transport->set_datagram_mutator(
+        [bad_client_prefix, bad_value](std::vector<uint8_t>& datagram)
+        {
+            tamper_ds_version(datagram, bad_client_prefix, bad_value);
+        });
+
+    /* Server */
+    PubSubParticipant<HelloWorldPubSubType> server_1(0u, 0u, 0u, 0u);
+    WireProtocolConfigQos server_1_qos;
+    GuidPrefix_t server_1_prefix;
+    std::istringstream("44.53.00.5f.45.50.52.4f.53.49.4d.41") >> server_1_prefix;
+    Locator_t locator_server_1;
+    ASSERT_TRUE(server_1.fill_server_qos(server_1_qos, server_1_prefix, locator_server_1, global_port,
+            LOCATOR_KIND_UDPv4)
+                    .disable_builtin_transport()
+                    .add_user_transport_to_pparams(server_transport)
+                    .init_participant());
+
+    RemoteServerAttributes server_1_att;
+    server_1_att.guidPrefix = server_1_prefix;
+    server_1_att.metatrafficUnicastLocatorList.push_back(locator_server_1);
+
+    /* Client announcing a malformed DS_VERSION */
+    PubSubParticipant<HelloWorldPubSubType> bad_client(0u, 0u, 0u, 0u);
+    WireProtocolConfigQos bad_client_qos;
+    bad_client_qos.prefix = bad_client_prefix;
+    bad_client_qos.builtin.discovery_config.discoveryProtocol = DiscoveryProtocol_t::CLIENT;
+    bad_client_qos.builtin.discovery_config.m_DiscoveryServers.push_back(server_1_att);
+
+    ASSERT_TRUE(bad_client.wire_protocol(bad_client_qos).init_participant());
+
+    // The server must reject it
+    EXPECT_FALSE(server_1.wait_discovery(std::chrono::seconds(3), 1));
+
+    /* Well-formed client, proves the server is still alive */
+    PubSubParticipant<HelloWorldPubSubType> good_client(0u, 0u, 0u, 0u);
+    WireProtocolConfigQos good_client_qos;
+    good_client_qos.builtin.discovery_config.discoveryProtocol = DiscoveryProtocol_t::CLIENT;
+    good_client_qos.builtin.discovery_config.m_DiscoveryServers.push_back(server_1_att);
+    ASSERT_TRUE(good_client.wire_protocol(good_client_qos).init_participant());
+
+    EXPECT_TRUE(server_1.wait_discovery(std::chrono::seconds(5), 1, true));
+}
+
+/**
+ * @test A Discovery Server must reject a client whose DS_VERSION is not a number and keep working.
+ *
+ * The server parsed DS_VERSION with std::stof, so a non-numeric value threw std::invalid_argument up
+ * to the reception thread and terminated the process.
+ */
+TEST(DDSDiscovery, ServerRejectsNonNumericDSVersion)
+{
+    check_server_rejects_ds_version("abc");
+}
+
+/**
+ * @test A Discovery Server must reject a client whose DS_VERSION does not fit in a float and keep
+ * working.
+ *
+ * Counterpart of the test above for std::out_of_range, which a fix catching only
+ * std::invalid_argument would miss.
+ */
+TEST(DDSDiscovery, ServerRejectsOutOfRangeDSVersion)
+{
+    check_server_rejects_ds_version("1e99999");
 }
