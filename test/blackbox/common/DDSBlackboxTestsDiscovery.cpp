@@ -2704,3 +2704,76 @@ TEST(DDSDiscovery, static_edp_malformed_entity_id_property)
     factory->delete_participant(attacker);
     factory->delete_participant(victim);
 }
+
+//! Start a server, a client announcing @p bad_value as its DS_VERSION, and a well-formed client.
+//! The server must reject the first one and still discover the second one.
+static void check_server_rejects_ds_version(
+        const std::string& bad_value)
+{
+    using namespace eprosima;
+    using namespace eprosima::fastdds::dds;
+    using namespace eprosima::fastrtps::rtps;
+
+    /* Server */
+    PubSubParticipant<HelloWorldPubSubType> server_1(0u, 0u, 0u, 0u);
+    WireProtocolConfigQos server_1_qos;
+    GuidPrefix_t server_1_prefix;
+    std::istringstream("44.53.00.5f.45.50.52.4f.53.49.4d.41") >> server_1_prefix;
+    Locator_t locator_server_1;
+    ASSERT_TRUE(server_1.fill_server_qos(server_1_qos, server_1_prefix, locator_server_1, global_port,
+            LOCATOR_KIND_UDPv4)
+                    .init_participant());
+
+    RemoteServerAttributes server_1_att;
+    server_1_att.guidPrefix = server_1_prefix;
+    server_1_att.metatrafficUnicastLocatorList.push_back(locator_server_1);
+
+    /* Client announcing a malformed DS_VERSION */
+    PubSubParticipant<HelloWorldPubSubType> bad_client(0u, 0u, 0u, 0u);
+    WireProtocolConfigQos bad_client_qos;
+    bad_client_qos.builtin.discovery_config.discoveryProtocol = DiscoveryProtocol_t::CLIENT;
+    bad_client_qos.builtin.discovery_config.m_DiscoveryServers.push_back(server_1_att);
+
+    PropertyPolicy bad_props;
+    bad_props.properties().emplace_back(Property("DS_VERSION", bad_value, true));
+
+    ASSERT_TRUE(bad_client.wire_protocol(bad_client_qos)
+                    .property_policy(bad_props)
+                    .init_participant());
+
+    // The server must reject it
+    EXPECT_FALSE(server_1.wait_discovery(std::chrono::seconds(3), 1));
+
+    /* Well-formed client, proves the server is still alive */
+    PubSubParticipant<HelloWorldPubSubType> good_client(0u, 0u, 0u, 0u);
+    WireProtocolConfigQos good_client_qos;
+    good_client_qos.builtin.discovery_config.discoveryProtocol = DiscoveryProtocol_t::CLIENT;
+    good_client_qos.builtin.discovery_config.m_DiscoveryServers.push_back(server_1_att);
+    ASSERT_TRUE(good_client.wire_protocol(good_client_qos).init_participant());
+
+    EXPECT_TRUE(server_1.wait_discovery(std::chrono::seconds(5), 1, true));
+}
+
+/**
+ * @test A Discovery Server must reject a client whose DS_VERSION is not a number and keep working.
+ *
+ * The server parsed DS_VERSION with std::stof, so a non-numeric value threw std::invalid_argument up
+ * to the reception thread and terminated the process. The value is injected as a propagated user
+ * property: the client announces it before its own DS_VERSION, so it is the one the server reads.
+ */
+TEST(DDSDiscovery, ServerRejectsNonNumericDSVersion)
+{
+    check_server_rejects_ds_version("abc");
+}
+
+/**
+ * @test A Discovery Server must reject a client whose DS_VERSION does not fit in a float and keep
+ * working.
+ *
+ * Counterpart of the test above for std::out_of_range, which a fix catching only
+ * std::invalid_argument would miss.
+ */
+TEST(DDSDiscovery, ServerRejectsOutOfRangeDSVersion)
+{
+    check_server_rejects_ds_version("1e99999");
+}
